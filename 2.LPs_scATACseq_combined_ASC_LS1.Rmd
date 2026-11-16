@@ -1,0 +1,725 @@
+---
+title: "Combined scATAC-seq: LS1 + ASC, Day0 / Day1 / Day3"
+author: "Thang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+<!--
+Design (mirrors the combined scATAC-seq Rmd)
+  6 samples = 2 cell lines (LS1, ASC) x 3 time points (Day0, Day1, Day3)
+  1  one common peak set for all 6 samples
+  2  QC per sample (thresholds per line) + optional doublet removal
+  3  LSI; unintegrated view + sample check; Harmony across CELL LINE only
+  4  clusters: DA peaks, gene activity markers, chromVAR motifs
+  5  differentiation response: day markers (peaks, motifs) within each line,
+     and the motif response compared between lines
+  6  TF regulators (chromVAR vs TF gene score) per line x stage + footprints
+  7  shared pseudotime + motifs along pseudotime per line
+  8  CNV from ATAC (fragment counts in 10 Mb bins vs ASC; focal amplicon genes)
+  9  differentiating subset
+  ATAC has no velocity equivalent (no spliced/unspliced reads).
+
+Packages: Seurat (v5), Signac, harmony, EnsDb.Hsapiens.v86, BSgenome.Hsapiens.UCSC.hg38,
+  JASPAR2020, TFBSTools, motifmatchr, monocle3, scDblFinder, ggrepel,
+  (chromVAR optional: Signac >= 1.17 no longer includes RunChromVAR, see run_chromvar_compat)
+  dplyr, tidyr, RANN
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 5)
+suppressPackageStartupMessages({
+  library("Seurat")
+  library("Signac")
+  library("GenomeInfoDb")
+  library("GenomicRanges")
+  library("EnsDb.Hsapiens.v86")
+  library("BSgenome.Hsapiens.UCSC.hg38")
+  library("JASPAR2020")
+  library("TFBSTools")
+  library("harmony")
+  library("Matrix")
+  library("ggplot2")
+  library("ggrepel")
+  library("dplyr")
+})
+set.seed(1234)
+```
+
+# Settings
+
+```{r settings}
+root_dir <- rprojroot::find_root(rprojroot::has_dir("LPS_ASC_diff"))
+atac_dir <- file.path(root_dir, "LPS_ASC_diff", "scATACseq")
+plot_dir <- file.path(atac_dir, "Plot_combined")
+res_dir  <- file.path(atac_dir, "Results_combined")
+for (d in c(plot_dir, res_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+tp_order   <- c("Day0", "Day1", "Day3")
+line_order <- c("ASC", "LS1")                # first = reference line
+
+samples <- expand.grid(timepoint = tp_order, cell_line = line_order, stringsAsFactors = FALSE)
+samples$sample <- paste0(samples$cell_line, "_", samples$timepoint)    # folder names, e.g. LS1_Day0
+samples$dir    <- file.path(atac_dir, samples$sample)
+samples
+for (d in samples$dir) {
+  f <- file.path(d, c("filtered_peak_bc_matrix.h5", "singlecell.csv",
+                      "fragments.tsv.gz", "fragments.tsv.gz.tbi"))
+  if (!all(file.exists(f))) stop("Missing in ", d, ": ", paste(basename(f)[!file.exists(f)], collapse = ", "))
+}
+
+# QC thresholds per line (placeholders - set them from the QC plots)
+qc_thr <- list(
+  LS1 = c(min_frag = 2000, max_frag = 50000, min_frip = 15, max_blacklist = 0.05, max_ns = 4, min_tss = 3),
+  ASC = c(min_frag = 2000, max_frag = 50000, min_frip = 15, max_blacklist = 0.05, max_ns = 4, min_tss = 3)
+)
+run_doublets <- TRUE
+
+lsi_dims <- 2:30                  # LSI_1 tracks depth
+harmony_dims <- seq_along(lsi_dims)
+cluster_resolution <- 0.4
+
+# TF regulators: one panel per line x stage
+tf_panels <- list("ASC Day0"        = list(line = "ASC", tps = "Day0"),
+                  "ASC Day1 - Day3" = list(line = "ASC", tps = c("Day1", "Day3")),
+                  "LS1 Day0"        = list(line = "LS1", tps = "Day0"),
+                  "LS1 Day1 - Day3" = list(line = "LS1", tps = c("Day1", "Day3")))
+tf_min_group_cells <- 30
+n_metacells <- 500; k_metacell <- 100; max_overlap <- 0.8
+cor_cut <- 0.5; padj_cut <- 0.01; delta_quantile <- 0.75
+n_labels <- 20
+do_footprint <- TRUE; n_footprint <- 6
+
+# CNV
+run_cnv <- TRUE
+cnv_bin_size <- 1e7                               # must match the scRNA Rmd
+focal_genes  <- c("MDM2", "CDK4", "HMGA2")        # 12q13-15 amplicon; change for your line
+focal_window <- 1e6                               # +/- around each focal gene
+```
+
+# Helper functions
+
+```{r helpers}
+composition_table <- function(obj, cluster_col, group_col = "timepoint") {
+  prop.table(table(cluster = obj@meta.data[[cluster_col]], group = obj@meta.data[[group_col]]), 1)
+}
+
+plot_composition <- function(obj, cluster_col, group_col, file) {
+  df <- as.data.frame(table(cluster = obj@meta.data[[cluster_col]], group = obj@meta.data[[group_col]]))
+  p <- ggplot(df, aes(cluster, Freq, fill = group)) + geom_col(position = "fill") +
+    labs(x = "Cluster", y = "Fraction of cells", fill = group_col) + theme_classic()
+  ggsave(file, p, width = 8, height = 4)
+  p
+}
+
+pick_root_cluster <- function(obj, cluster_col, root_tp = "Day0", min_cells = 50) {
+  prop <- composition_table(obj, cluster_col)
+  n <- table(obj@meta.data[[cluster_col]]); ok <- names(n)[n >= min_cells]
+  ok[which.max(prop[ok, root_tp])]
+}
+
+pick_diff_clusters <- function(obj, cluster_col, root_tp = "Day0", max_root_frac = 0.5) {
+  prop <- composition_table(obj, cluster_col)
+  unique(c(pick_root_cluster(obj, cluster_col, root_tp), rownames(prop)[prop[, root_tp] < max_root_frac]))
+}
+
+run_monocle3 <- function(obj, assay, cluster_col, out_col, reduction = "umap", root_tp = "Day0") {
+  counts <- GetAssayData(obj, assay = assay, layer = "counts")
+  cds <- monocle3::new_cell_data_set(
+    expression_data = counts,
+    cell_metadata   = obj@meta.data[colnames(counts), , drop = FALSE],
+    gene_metadata   = data.frame(gene_short_name = rownames(counts), row.names = rownames(counts)))
+  SingleCellExperiment::reducedDim(cds, "UMAP") <- Embeddings(obj, reduction)[colnames(cds), ]
+  cds <- monocle3::cluster_cells(cds, reduction_method = "UMAP")
+  cds <- monocle3::learn_graph(cds, use_partition = FALSE)
+  root_cl <- pick_root_cluster(obj, cluster_col, root_tp)
+  root_cells <- colnames(obj)[obj@meta.data[[cluster_col]] == root_cl & obj$timepoint == root_tp]
+  cds <- monocle3::order_cells(cds, root_cells = root_cells)
+  pt <- monocle3::pseudotime(cds)[colnames(obj)]; pt[is.infinite(pt)] <- NA
+  obj[[out_col]] <- pt
+  list(obj = obj, cds = cds)
+}
+# Sum counts per group (features x groups)
+pseudobulk_sum <- function(mat, groups) {
+  groups <- factor(groups)
+  ind <- sparseMatrix(i = seq_along(groups), j = as.integer(groups), x = 1,
+                      dims = c(length(groups), nlevels(groups)), dimnames = list(NULL, levels(groups)))
+  as.matrix(mat %*% ind)
+}
+# LSI + Harmony (by cell line) + clusters + UMAP
+process_lsi_harmony <- function(obj) {
+  DefaultAssay(obj) <- "peaks"
+  obj <- RunTFIDF(obj)
+  obj <- FindTopFeatures(obj, min.cutoff = "q0")
+  obj <- RunSVD(obj)
+  obj <- RunHarmony(obj, group.by.vars = "cell_line", reduction.use = "lsi", dims.use = lsi_dims,
+                    reduction.save = "harmony", project.dim = FALSE, verbose = FALSE)
+  obj <- FindNeighbors(obj, reduction = "harmony", dims = harmony_dims)
+  obj <- RunUMAP(obj, reduction = "harmony", dims = harmony_dims, reduction.name = "umap", verbose = FALSE)
+  obj
+}
+# --- chromVAR motif deviation z-scores ---
+# Signac >= 1.17 removed RunChromVAR() (chromVAR left Bioconductor 3.23).
+# Uses the chromVAR package if it is installed (remotes::install_github("GreenleafLab/chromVAR"));
+# otherwise runs the same algorithm here: per cell, observed vs expected fragments in each
+# motif's peaks, corrected with background peak sets matched on GC content and accessibility.
+# Needs AddMotifs() and RegionStats() first. Result: "chromvar" assay of z-scores (as before).
+run_chromvar_compat <- function(object, genome, assay = "peaks", n_bg = 50, chunk_size = 5000,
+                                seed = 1, use_package = TRUE) {
+  counts    <- GetAssayData(object, assay = assay, layer = "counts")
+  motif_mat <- GetMotifData(object, assay = assay, slot = "data")
+  if (is.null(motif_mat) || length(motif_mat) == 0) stop("Run AddMotifs() first")
+  motif_mat <- motif_mat[rownames(counts), , drop = FALSE]
+  keep <- Matrix::rowSums(counts) > 0
+  counts <- counts[keep, ]; motif_mat <- motif_mat[keep, , drop = FALSE]
+  motif_mat <- motif_mat[, Matrix::colSums(motif_mat) > 0, drop = FALSE]
+
+  if (use_package && requireNamespace("chromVAR", quietly = TRUE)) {
+    message("chromVAR package found - using chromVAR::computeDeviations")
+    se <- SummarizedExperiment::SummarizedExperiment(
+      assays = list(counts = counts), rowRanges = StringToGRanges(rownames(counts), sep = c("-", "-")))
+    se <- chromVAR::addGCBias(se, genome = genome)
+    b <- SummarizedExperiment::rowData(se)$bias
+    b[is.na(b)] <- mean(b, na.rm = TRUE)
+    SummarizedExperiment::rowData(se)$bias <- b
+    bg  <- chromVAR::getBackgroundPeaks(se)
+    dev <- chromVAR::computeDeviations(se, annotations = motif_mat, background_peaks = bg)
+    z <- chromVAR::deviationScores(dev)
+    rownames(z) <- colnames(motif_mat)
+  } else {
+    message("chromVAR package not found - using built-in implementation (", n_bg, " background sets)")
+    mf <- object[[assay]][[]]
+    if (!"GC.percent" %in% colnames(mf)) stop("Run RegionStats() first")
+    gc  <- mf[rownames(counts), "GC.percent"]; gc[is.na(gc)] <- mean(gc, na.rm = TRUE)
+    acc <- log1p(Matrix::rowSums(counts))
+    strata <- interaction(cut(rank(gc,  ties.method = "first"), 10, labels = FALSE),
+                          cut(rank(acc, ties.method = "first"), 10, labels = FALSE), drop = TRUE)
+    by_stratum <- split(seq_along(strata), strata)
+    set.seed(seed)
+    perms <- lapply(seq_len(n_bg), function(i) {
+      p <- seq_along(strata)
+      for (ix in by_stratum) p[ix] <- ix[sample.int(length(ix))]
+      p
+    })
+    M    <- methods::as(motif_mat * 1, "CsparseMatrix")
+    frac <- Matrix::rowSums(counts) / sum(counts)
+    dev_fun <- function(Mx, cnt) {
+      depth <- Matrix::colSums(cnt)
+      obs <- as.matrix(Matrix::crossprod(Mx, cnt))
+      ex  <- outer(as.numeric(Matrix::crossprod(Mx, frac)), depth)
+      (obs - ex) / ex
+    }
+    chunks <- split(seq_len(ncol(counts)), ceiling(seq_len(ncol(counts)) / chunk_size))
+    z <- do.call(cbind, lapply(chunks, function(ci) {
+      cnt <- counts[, ci, drop = FALSE]
+      d0 <- dev_fun(M, cnt); s1 <- 0; s2 <- 0
+      for (p in perms) { d <- dev_fun(M[p, , drop = FALSE], cnt); s1 <- s1 + d; s2 <- s2 + d^2 }
+      mu <- s1 / n_bg; sdv <- sqrt(pmax(s2 / n_bg - mu^2, 1e-12))
+      (d0 - mu) / sdv
+    }))
+    rownames(z) <- colnames(motif_mat); colnames(z) <- colnames(counts)
+  }
+  z[!is.finite(z)] <- 0
+  z <- z[, colnames(object), drop = FALSE]
+  object[["chromvar"]] <- CreateAssayObject(data = z)
+  object
+}
+
+# --- TF regulators (ArchR-style) ---
+make_metacells <- function(emb, n_groups, k, max_overlap) {
+  n <- nrow(emb); k <- min(k, n - 1)
+  nn <- RANN::nn2(emb, k = k)$nn.idx
+  groups <- list()
+  for (s in sample(n)) {
+    g <- nn[s, ]
+    if (length(groups) > 0 &&
+        any(vapply(groups, function(x) sum(x %in% g) / k > max_overlap, logical(1)))) next
+    groups[[length(groups) + 1]] <- g
+    if (length(groups) >= n_groups) break
+  }
+  sparseMatrix(i = unlist(groups), j = rep(seq_along(groups), lengths(groups)),
+               x = rep(1 / lengths(groups), lengths(groups)), dims = c(n, length(groups)))
+}
+
+row_cor <- function(A, B) {
+  A <- A - rowMeans(A); B <- B - rowMeans(B)
+  rowSums(A * B) / sqrt(rowSums(A^2) * rowSums(B^2))
+}
+
+tf_regulators <- function(obj, cells, panel, dev, gs, motif_map, group_col, reduction = "harmony") {
+  M  <- make_metacells(Embeddings(obj, reduction)[cells, ], n_metacells, k_metacell, max_overlap)
+  nm <- ncol(M)
+  r  <- row_cor(as.matrix(dev[motif_map$motif, cells] %*% M), as.matrix(gs[motif_map$gene, cells] %*% M))
+  pval <- 2 * pt(-abs(r * sqrt((nm - 2) / pmax(1 - r^2, 1e-12))), df = nm - 2)
+  grp  <- as.character(obj@meta.data[cells, group_col])
+  keep <- names(which(table(grp) >= tf_min_group_cells))
+  if (length(keep) < 2) warning(panel, ": <2 groups with enough cells; max delta = 0")
+  gm <- vapply(keep, function(g) rowMeans(dev[, cells[grp == g], drop = FALSE]), numeric(nrow(dev)))
+  gm <- matrix(gm, nrow = nrow(dev), dimnames = list(rownames(dev), keep))
+  max_delta <- apply(gm, 1, max) - apply(gm, 1, min)
+  res <- motif_map %>%
+    mutate(cor = r, pval = pval, padj = p.adjust(pval, "BH"), maxDelta = max_delta[motif], panel = panel) %>%
+    dplyr::filter(!is.na(cor)) %>% group_by(motif) %>% slice_max(cor, n = 1, with_ties = FALSE) %>% ungroup() %>%
+    mutate(label = paste0(motif_name, "_", motif))
+  dcut <- quantile(res$maxDelta, delta_quantile, na.rm = TRUE)
+  res %>% mutate(TFRegulator = ifelse(cor > cor_cut & padj < padj_cut & maxDelta > dcut, "YES", "NO"),
+                 n_metacells = nm) %>% arrange(desc(TFRegulator == "YES"), desc(maxDelta))
+}
+
+plot_tf_regulators <- function(res, xlab) {
+  lab <- res %>% dplyr::filter(TFRegulator == "YES") %>% group_by(panel) %>% slice_max(maxDelta, n = n_labels)
+  ggplot(res, aes(cor, maxDelta, colour = TFRegulator)) +
+    geom_point(data = dplyr::filter(res, TFRegulator == "NO"), size = 1.2) +
+    geom_point(data = dplyr::filter(res, TFRegulator == "YES"), size = 1.8) +
+    geom_text_repel(data = lab, aes(label = label), size = 2.4, colour = "firebrick3",
+                    max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2, show.legend = FALSE) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    scale_colour_manual(values = c(NO = "grey60", YES = "firebrick3"), name = "TFRegulator") +
+    facet_wrap(~ panel, nrow = 2) + labs(x = xlab, y = "Max TF Motif Delta") + theme_bw() +
+    theme(panel.grid = element_blank(), strip.background = element_blank(),
+          strip.text = element_text(face = "bold"))
+}
+```
+
+# 1. Common peak set + annotation
+
+```{r peaks}
+peak_list <- lapply(samples$dir, function(d) {
+  StringToGRanges(rownames(Read10X_h5(file.path(d, "filtered_peak_bc_matrix.h5"))), sep = c(":", "-"))
+})
+combined_peaks <- reduce(do.call(c, peak_list))
+pw <- width(combined_peaks)
+combined_peaks <- keepStandardChromosomes(combined_peaks[pw > 20 & pw < 10000], pruning.mode = "coarse")
+message("Common peak set: ", length(combined_peaks), " peaks")
+
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+annotations <- tryCatch({ seqlevelsStyle(annotations) <- "UCSC"; annotations },
+  error = function(e) {
+    sl <- paste0("chr", seqlevels(annotations)); sl[sl == "chrMT"] <- "chrM"
+    renameSeqlevels(annotations, setNames(sl, seqlevels(annotations)))
+  })
+genome(annotations) <- "hg38"
+```
+
+# 2. Per-sample objects, merge
+
+```{r objects}
+atac_list <- lapply(seq_len(nrow(samples)), function(i) {
+  d  <- samples$dir[i]
+  md <- read.csv(file.path(d, "singlecell.csv"), header = TRUE, row.names = 1)
+  md <- md[md$is__cell_barcode == 1, ]
+  frags  <- CreateFragmentObject(path = file.path(d, "fragments.tsv.gz"), cells = rownames(md))
+  counts <- FeatureMatrix(fragments = frags, features = combined_peaks, cells = rownames(md))
+  obj <- CreateSeuratObject(
+    counts = CreateChromatinAssay(counts = counts, fragments = frags, genome = "hg38",
+                                  annotation = annotations, min.cells = 10),
+    assay = "peaks", meta.data = md, project = samples$sample[i])
+  obj$sample <- samples$sample[i]; obj$cell_line <- samples$cell_line[i]; obj$timepoint <- samples$timepoint[i]
+  obj
+})
+atac <- merge(atac_list[[1]], y = atac_list[-1], add.cell.ids = samples$sample)
+rm(atac_list); invisible(gc())
+atac$sample    <- factor(atac$sample, levels = samples$sample)
+atac$cell_line <- factor(atac$cell_line, levels = line_order)
+atac$timepoint <- factor(atac$timepoint, levels = tp_order)
+atac$group     <- atac$sample
+```
+
+# 3. QC
+
+```{r qc}
+atac <- NucleosomeSignal(atac)
+atac <- TSSEnrichment(atac)
+atac$pct_reads_in_peaks <- atac$peak_region_fragments / atac$passed_filters * 100
+atac$blacklist_ratio    <- FractionCountsInRegion(atac, assay = "peaks", regions = blacklist_hg38_unified)
+
+p <- VlnPlot(atac, c("nCount_peaks", "TSS.enrichment", "nucleosome_signal",
+                     "pct_reads_in_peaks", "blacklist_ratio"),
+             group.by = "sample", pt.size = 0, ncol = 5) & RotatedAxis()
+ggsave(file.path(plot_dir, "01_QC_violin.pdf"), p, width = 20, height = 5)
+p
+p <- FragmentHistogram(atac, group.by = "sample")
+ggsave(file.path(plot_dir, "01_fragment_length.pdf"), p, width = 12, height = 6)
+
+thr <- do.call(rbind, qc_thr)[as.character(atac$cell_line), ]
+keep <- atac$nCount_peaks > thr[, "min_frag"] & atac$nCount_peaks < thr[, "max_frag"] &
+  atac$pct_reads_in_peaks > thr[, "min_frip"] & atac$blacklist_ratio < thr[, "max_blacklist"] &
+  atac$nucleosome_signal < thr[, "max_ns"] & atac$TSS.enrichment > thr[, "min_tss"]
+print(table(atac$sample, keep))
+atac <- subset(atac, cells = colnames(atac)[keep])
+
+if (run_doublets && requireNamespace("scDblFinder", quietly = TRUE)) {
+  dbl <- scDblFinder::scDblFinder(GetAssayData(atac, assay = "peaks", layer = "counts"),
+                                  samples = atac$sample, aggregateFeatures = TRUE,
+                                  nfeatures = 25, processing = "normFeatures")
+  atac$doublet_class <- dbl$scDblFinder.class
+  print(table(atac$sample, atac$doublet_class))
+  atac <- subset(atac, doublet_class == "singlet")
+}
+```
+
+# 4. LSI, sample check, Harmony integration across lines
+
+```{r lsi}
+DefaultAssay(atac) <- "peaks"
+atac <- RunTFIDF(atac)
+atac <- FindTopFeatures(atac, min.cutoff = "q0")
+atac <- RunSVD(atac)
+DepthCor(atac)
+
+# A. No correction
+atac <- RunUMAP(atac, reduction = "lsi", dims = lsi_dims, reduction.name = "umap.unintegrated", verbose = FALSE)
+p <- DimPlot(atac, reduction = "umap.unintegrated", group.by = c("cell_line", "timepoint"), ncol = 2)
+ggsave(file.path(plot_dir, "02_UMAP_unintegrated.pdf"), p, width = 12, height = 5)
+p
+
+# Sample check: pseudobulk accessibility of the most variable peaks
+pb <- pseudobulk_sum(GetAssayData(atac, assay = "peaks", layer = "counts"), atac$sample)
+pb_log2 <- log2(t(t(pb) / colSums(pb)) * 1e6 + 1)
+top_var <- head(order(apply(pb_log2, 1, var), decreasing = TRUE), 20000)
+cor_mat <- cor(pb_log2[top_var, samples$sample])
+write.csv(cor_mat, file.path(res_dir, "sample_pseudobulk_correlation.csv"))
+pca_pb <- prcomp(t(pb_log2[top_var, samples$sample]), scale. = TRUE)
+pc_df  <- cbind(as.data.frame(pca_pb$x[, 1:2]), samples)
+p1 <- ggplot(as.data.frame(as.table(cor_mat)), aes(Var1, Var2, fill = Freq)) + geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3) + scale_fill_viridis_c(name = "r") +
+  labs(x = NULL, y = NULL) + theme_minimal() + RotatedAxis()
+p2 <- ggplot(pc_df, aes(PC1, PC2, colour = cell_line, label = timepoint)) +
+  geom_path(aes(group = cell_line), arrow = arrow(length = unit(0.2, "cm"))) +
+  geom_point(size = 3) + geom_text_repel() + theme_classic()
+ggsave(file.path(plot_dir, "02_sample_check.pdf"), p1 + p2, width = 12, height = 5)
+p1 + p2
+
+# B. Harmony across cell lines (time point is not corrected)
+atac <- process_lsi_harmony(atac)
+for (r in c(0.2, 0.4, 0.6, 0.8)) atac <- FindClusters(atac, algorithm = 3, resolution = r, verbose = FALSE)
+atac$atac_clusters <- atac@meta.data[[paste0("peaks_snn_res.", cluster_resolution)]]
+Idents(atac) <- "atac_clusters"
+
+p <- DimPlot(atac, group.by = c("atac_clusters", "cell_line", "timepoint"), label = TRUE, ncol = 3)
+ggsave(file.path(plot_dir, "03_UMAP_integrated.pdf"), p, width = 18, height = 5)
+p
+p1 <- plot_composition(atac, "atac_clusters", "cell_line", file.path(plot_dir, "03_cluster_by_line.pdf"))
+p2 <- plot_composition(atac, "atac_clusters", "group", file.path(plot_dir, "03_cluster_by_sample.pdf"))
+p1 + p2
+```
+
+# 5. Cluster markers: peaks, gene activity, motifs
+
+```{r cluster-markers}
+DefaultAssay(atac) <- "peaks"
+da_peaks <- FindAllMarkers(atac, only.pos = TRUE, test.use = "LR", latent.vars = "nCount_peaks",
+                           min.pct = 0.05, logfc.threshold = 0.25)
+cf <- ClosestFeature(atac, regions = unique(da_peaks$gene))
+da_peaks <- left_join(da_peaks, cf[, c("query_region", "gene_name", "distance")], by = c("gene" = "query_region"))
+write.csv(da_peaks, file.path(res_dir, "DA_peaks_clusters.csv"), row.names = FALSE)
+
+atac[["ACTIVITY"]] <- CreateAssayObject(counts = GeneActivity(atac))
+atac <- NormalizeData(atac, assay = "ACTIVITY", normalization.method = "LogNormalize",
+                      scale.factor = median(atac$nCount_ACTIVITY))
+DefaultAssay(atac) <- "ACTIVITY"
+ga_markers <- FindAllMarkers(atac, only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+write.csv(ga_markers, file.path(res_dir, "gene_activity_markers_clusters.csv"), row.names = FALSE)
+top5 <- ga_markers %>% dplyr::filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 5)
+p <- DotPlot(atac, features = unique(top5$gene)) + RotatedAxis()
+ggsave(file.path(plot_dir, "04_gene_activity_dotplot.pdf"), p, width = 16, height = 5)
+p
+
+# Motifs + chromVAR
+DefaultAssay(atac) <- "peaks"
+pfm <- getMatrixSet(JASPAR2020, opts = list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE))
+atac <- AddMotifs(atac, genome = BSgenome.Hsapiens.UCSC.hg38, pfm = pfm)
+atac <- RegionStats(atac, genome = BSgenome.Hsapiens.UCSC.hg38)
+atac <- run_chromvar_compat(atac, genome = BSgenome.Hsapiens.UCSC.hg38)   # replaces Signac::RunChromVAR
+
+motif_enrich <- bind_rows(lapply(levels(Idents(atac)), function(cl) {
+  pk <- da_peaks$gene[da_peaks$cluster == cl & da_peaks$p_val_adj < 0.05]
+  if (length(pk) < 50) return(NULL)
+  FindMotifs(atac, features = pk) %>% mutate(cluster = cl)
+}))
+write.csv(motif_enrich, file.path(res_dir, "motif_enrichment_DA_peaks.csv"), row.names = FALSE)
+
+DefaultAssay(atac) <- "chromvar"
+cv_markers <- FindAllMarkers(atac, only.pos = TRUE, mean.fxn = rowMeans, fc.name = "avg_diff")
+cv_markers$motif_name <- ConvertMotifID(atac, assay = "peaks", id = cv_markers$gene)
+write.csv(cv_markers, file.path(res_dir, "chromvar_motifs_clusters.csv"), row.names = FALSE)
+DefaultAssay(atac) <- "peaks"
+```
+
+# 6. Differentiation response
+
+```{r day-markers, fig.height = 6}
+dev_all <- as.matrix(GetAssayData(atac, assay = "chromvar", layer = "data"))
+motif_names <- setNames(ConvertMotifID(atac, assay = "peaks", id = rownames(dev_all)), rownames(dev_all))
+
+# (a) Day markers within each line: peaks and motifs (each day vs the other days)
+day_peaks <- list(); day_motifs <- list()
+for (ln in line_order) {
+  obj <- subset(atac, cells = colnames(atac)[atac$cell_line == ln])
+  Idents(obj) <- "timepoint"
+  DefaultAssay(obj) <- "peaks"
+  day_peaks[[ln]] <- FindAllMarkers(obj, only.pos = TRUE, test.use = "LR", latent.vars = "nCount_peaks",
+                                    min.pct = 0.05, logfc.threshold = 0.25, verbose = FALSE) %>%
+    rename(timepoint = cluster) %>% mutate(cell_line = ln)
+  DefaultAssay(obj) <- "chromvar"
+  day_motifs[[ln]] <- FindAllMarkers(obj, only.pos = TRUE, mean.fxn = rowMeans, fc.name = "avg_diff",
+                                     verbose = FALSE) %>%
+    rename(timepoint = cluster) %>% mutate(cell_line = ln, motif_name = motif_names[gene])
+}
+day_peaks <- bind_rows(day_peaks)
+cf <- ClosestFeature(atac, regions = unique(day_peaks$gene))
+day_peaks <- left_join(day_peaks, cf[, c("query_region", "gene_name", "distance")], by = c("gene" = "query_region"))
+day_motifs <- bind_rows(day_motifs)
+write.csv(day_peaks,  file.path(res_dir, "day_marker_peaks_within_line.csv"), row.names = FALSE)
+write.csv(day_motifs, file.path(res_dir, "day_marker_motifs_within_line.csv"), row.names = FALSE)
+
+# (b) Day motifs shared by both lines
+day_motifs_shared <- day_motifs %>% dplyr::filter(p_val_adj < 0.05) %>%
+  group_by(timepoint, gene, motif_name) %>% dplyr::filter(n_distinct(cell_line) == length(line_order)) %>%
+  summarise(mean_avg_diff = mean(avg_diff), .groups = "drop") %>% arrange(timepoint, desc(mean_avg_diff))
+write.csv(day_motifs_shared, file.path(res_dir, "day_marker_motifs_shared.csv"), row.names = FALSE)
+
+# Heatmap: mean chromVAR z of top day motifs across the 6 samples
+top_m <- day_motifs %>% dplyr::filter(p_val_adj < 0.05) %>% group_by(cell_line, timepoint) %>%
+  slice_max(avg_diff, n = 6) %>% ungroup() %>% arrange(timepoint) %>% distinct(gene, .keep_all = TRUE)
+grp_mean <- vapply(samples$sample, function(s) rowMeans(dev_all[top_m$gene, atac$sample == s, drop = FALSE]),
+                   numeric(nrow(top_m)))
+rownames(grp_mean) <- paste0(motif_names[top_m$gene], "_", top_m$gene)
+hm <- as.data.frame(as.table(grp_mean)); colnames(hm) <- c("motif", "sample", "z")
+hm$motif <- factor(hm$motif, levels = rev(rownames(grp_mean)))
+hm$day_marker_of <- top_m$timepoint[match(hm$motif, rownames(grp_mean))]
+p <- ggplot(hm, aes(sample, motif, fill = z)) + geom_tile() +
+  facet_grid(day_marker_of ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(low = "#3B4CC0", mid = "white", high = "#B40426", name = "chromVAR z") +
+  labs(x = NULL, y = NULL) + theme_minimal() + RotatedAxis() + theme(axis.text.y = element_text(size = 6))
+ggsave(file.path(plot_dir, "05_day_motifs_heatmap.pdf"), p, width = 6, height = 2 + 0.13 * nrow(grp_mean),
+       limitsize = FALSE)
+p
+
+# (c) Motif response compared between lines: change in mean chromVAR z, Day3 - Day0
+mean_z <- vapply(samples$sample, function(s) rowMeans(dev_all[, atac$sample == s, drop = FALSE]),
+                 numeric(nrow(dev_all)))
+resp_m <- data.frame(motif = rownames(dev_all), motif_name = motif_names)
+for (ln in line_order) resp_m[[paste0(ln, "_Day3_vs_Day0")]] <- mean_z[, paste0(ln, "_Day3")] - mean_z[, paste0(ln, "_Day0")]
+a <- paste0(line_order[1], "_Day3_vs_Day0"); b <- paste0(line_order[2], "_Day3_vs_Day0")
+resp_m$diff <- resp_m[[b]] - resp_m[[a]]
+write.csv(resp_m, file.path(res_dir, "motif_response_comparison.csv"), row.names = FALSE)
+lab <- bind_rows(slice_max(resp_m, .data[[a]] + .data[[b]], n = 8), slice_min(resp_m, .data[[a]] + .data[[b]], n = 8),
+                 slice_max(resp_m, abs(diff), n = 10))
+p <- ggplot(resp_m, aes(.data[[a]], .data[[b]])) + geom_point(colour = "grey60", size = 0.8) +
+  geom_abline(linetype = "dashed") + geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+  geom_text_repel(data = distinct(lab, motif, .keep_all = TRUE), aes(label = motif_name),
+                  size = 2.5, max.overlaps = Inf, colour = "firebrick3") +
+  labs(x = paste(line_order[1], "change in chromVAR z (Day3 - Day0)"),
+       y = paste(line_order[2], "change in chromVAR z (Day3 - Day0)")) + theme_classic()
+ggsave(file.path(plot_dir, "05_motif_response_comparison.pdf"), p, width = 7, height = 6.5)
+p
+
+# Peak response per line (pseudobulk log2FC Day3 vs Day0), classified
+acc <- rowMeans(pb_log2) > 1
+resp_p <- data.frame(peak = rownames(pb_log2)[acc])
+for (ln in line_order) resp_p[[paste0(ln, "_Day3_vs_Day0")]] <- pb_log2[acc, paste0(ln, "_Day3")] - pb_log2[acc, paste0(ln, "_Day0")]
+resp_p$class <- case_when(
+  resp_p[[a]] > 1 & resp_p[[b]] > 1 ~ "opens in both",
+  resp_p[[a]] < -1 & resp_p[[b]] < -1 ~ "closes in both",
+  resp_p[[a]] > 1 & abs(resp_p[[b]]) < 0.5 ~ paste("opens only in", line_order[1]),
+  resp_p[[b]] > 1 & abs(resp_p[[a]]) < 0.5 ~ paste("opens only in", line_order[2]),
+  TRUE ~ "other")
+print(table(resp_p$class))
+cf <- ClosestFeature(atac, regions = resp_p$peak[resp_p$class != "other"])
+resp_p <- left_join(resp_p, cf[, c("query_region", "gene_name", "distance")], by = c("peak" = "query_region"))
+write.csv(resp_p, file.path(res_dir, "peak_response_comparison.csv"), row.names = FALSE)
+```
+
+# 7. TF regulators (per line x stage) and footprints
+
+```{r tf-regulators, fig.height = 10}
+gs_all <- GetAssayData(atac, assay = "ACTIVITY", layer = "data")
+motif_map <- data.frame(motif = names(motif_names), motif_name = motif_names) %>%
+  mutate(gene = strsplit(toupper(gsub("\\(var\\.\\d+\\)", "", motif_name)), "::")) %>%
+  tidyr::unnest(gene) %>% dplyr::filter(gene %in% rownames(gs_all)) %>% as.data.frame()
+
+tf_res <- bind_rows(lapply(names(tf_panels), function(pn) {
+  pp <- tf_panels[[pn]]
+  cells <- colnames(atac)[atac$cell_line == pp$line & atac$timepoint %in% pp$tps]
+  tf_regulators(atac, cells, pn, dev_all, gs_all, motif_map, "atac_clusters")
+}))
+tf_res$panel <- factor(tf_res$panel, levels = names(tf_panels))
+write.csv(tf_res, file.path(res_dir, "TF_regulators_gene_activity.csv"), row.names = FALSE)
+tf_wide <- tf_res %>% dplyr::select(motif, motif_name, gene, panel, TFRegulator) %>%
+  tidyr::pivot_wider(names_from = panel, values_from = TFRegulator)
+write.csv(tf_wide, file.path(res_dir, "TF_regulators_by_panel.csv"), row.names = FALSE)
+
+p <- plot_tf_regulators(tf_res, "Correlation to gene score")
+ggsave(file.path(plot_dir, "06_TF_regulators.pdf"), p, width = 11, height = 11)
+p
+
+if (do_footprint) {
+  top_fp <- tf_res %>% dplyr::filter(TFRegulator == "YES") %>% arrange(desc(maxDelta)) %>%
+    distinct(motif_name) %>% head(n_footprint) %>% pull(motif_name)
+  if (length(top_fp) > 0) {
+    atac <- Footprint(atac, motif.name = top_fp, genome = BSgenome.Hsapiens.UCSC.hg38, in.peaks = TRUE)
+    pdf(file.path(plot_dir, "06_TF_footprints.pdf"), width = 8, height = 5)
+    for (tf in top_fp) print(PlotFootprint(atac, features = tf, group.by = "group"))
+    dev.off()
+  }
+}
+```
+
+# 8. Shared pseudotime
+
+```{r pseudotime}
+mon <- run_monocle3(atac, assay = "peaks", cluster_col = "atac_clusters", out_col = "atac_pseudotime")
+atac <- mon$obj
+p1 <- monocle3::plot_cells(mon$cds, color_cells_by = "pseudotime", label_branch_points = TRUE)
+p2 <- ggplot(atac@meta.data, aes(timepoint, atac_pseudotime, fill = cell_line)) +
+  geom_violin(scale = "width", position = position_dodge(0.8)) + theme_classic() + labs(x = NULL)
+ggsave(file.path(plot_dir, "07_pseudotime.pdf"), p1 + p2, width = 12, height = 5)
+p1 + p2
+
+# Motifs that change along pseudotime, per line
+motif_pt <- bind_rows(lapply(line_order, function(ln) {
+  ok  <- atac$cell_line == ln & !is.na(atac$atac_pseudotime)
+  rho <- apply(dev_all[, ok], 1, cor, y = atac$atac_pseudotime[ok], method = "spearman")
+  data.frame(cell_line = ln, motif = names(rho), motif_name = motif_names[names(rho)], spearman_rho = rho)
+}))
+write.csv(motif_pt, file.path(res_dir, "motifs_vs_pseudotime_by_line.csv"), row.names = FALSE)
+```
+
+# 9. CNV from scATAC
+
+Fragments are counted in 10 Mb bins per cell and compared with ASC cells from the
+same day (same day = similar accessibility, so differentiation changes cancel out).
+Large bins and smoothing over 50 neighbouring cells keep the noise down. Focal
+amplicons are scored separately in +/- 1 Mb windows around the focal genes.
+Accessibility differences can still mimic small CNVs - trust large, consistent signals,
+and check them against the inferCNV result from RNA (integration Rmd).
+`epiAneufinder` (R) is an established ATAC CNV caller worth running for confirmation.
+
+```{r cnv-atac, fig.height = 4}
+if (run_cnv) {
+  chroms <- paste0("chr", c(1:22, "X"))
+  bins <- tileGenome(seqlengths(BSgenome.Hsapiens.UCSC.hg38)[chroms], tilewidth = cnv_bin_size,
+                     cut.last.tile.in.chrom = TRUE)
+  bin_counts <- FeatureMatrix(fragments = Fragments(atac), features = bins, cells = colnames(atac))
+  bin_counts <- bin_counts[rowSums(bin_counts) > 0.2 * median(rowSums(bin_counts)), colnames(atac)]   # drop near-empty bins; cells in object order
+  cpm <- t(t(as.matrix(bin_counts)) / colSums(bin_counts)) * 1e6
+
+  # Smooth each cell over its 50 nearest neighbours (harmony space)
+  nn  <- RANN::nn2(Embeddings(atac, "harmony"), k = 50)$nn.idx
+  S   <- sparseMatrix(i = as.vector(nn), j = rep(seq_len(nrow(nn)), ncol(nn)), x = 1 / ncol(nn),
+                      dims = c(ncol(cpm), ncol(cpm)))
+  cpm_s <- cpm %*% S; colnames(cpm_s) <- colnames(cpm)
+
+  # log2 ratio vs reference cells (same day, reference line)
+  ratio <- matrix(NA_real_, nrow(cpm_s), ncol(cpm_s), dimnames = dimnames(cpm_s))
+  for (tp in tp_order) {
+    ref <- atac$cell_line == line_order[1] & atac$timepoint == tp
+    in_tp <- atac$timepoint == tp
+    ratio[, in_tp] <- log2((as.matrix(cpm_s[, in_tp]) + 1) / (rowMeans(cpm_s[, ref, drop = FALSE]) + 1))
+  }
+  ratio <- t(t(ratio) - apply(ratio, 2, median))        # centre each cell
+  atac$cnv_score_atac <- colMeans(ratio^2)
+
+  # Per-sample bin profile (same 10 Mb bins as the RNA Rmd)
+  bin_gr <- StringToGRanges(rownames(ratio), sep = c("-", "-"))
+  cnv_bins_atac <- bind_rows(lapply(samples$sample, function(s) {
+    data.frame(sample = s, chr = as.character(seqnames(bin_gr)), bin_start = start(bin_gr),
+               value = rowMeans(ratio[, atac$sample == s, drop = FALSE]))
+  }))
+  write.csv(cnv_bins_atac, file.path(res_dir, "cnv_bins_atac.csv"), row.names = FALSE)
+
+  cnv_bins_atac$chr <- factor(cnv_bins_atac$chr, levels = chroms)
+  cnv_bins_atac$sample <- factor(cnv_bins_atac$sample, levels = samples$sample)
+  p1 <- ggplot(cnv_bins_atac, aes(bin_start / 1e6, sample, fill = value)) + geom_tile() +
+    facet_grid(. ~ chr, scales = "free_x", space = "free_x") +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "log2 ratio",
+                         limits = c(-1, 1), oob = scales::squish) +
+    labs(x = NULL, y = NULL) + theme_minimal() +
+    theme(axis.text.x = element_blank(), panel.spacing = unit(0, "lines"), strip.text = element_text(size = 6))
+  ggsave(file.path(plot_dir, "08_cnv_bins_by_sample.pdf"), p1, width = 14, height = 3.5)
+  p1
+
+  # Per-cell heatmap (down-sampled), cells grouped by sample
+  set.seed(1)
+  cells_hm <- unlist(lapply(split(colnames(atac), atac$sample), function(x) sample(x, min(300, length(x)))))
+  hm <- as.data.frame(as.table(ratio[, cells_hm])); colnames(hm) <- c("bin", "cell", "value")
+  hm$chr <- factor(sub("-.*", "", hm$bin), levels = chroms)
+  hm$bin_start <- as.numeric(sub("^[^-]+-([0-9]+)-.*", "\\1", hm$bin))
+  hm$sample <- atac@meta.data[as.character(hm$cell), "sample"]
+  hm$cell <- factor(hm$cell, levels = cells_hm)
+  p2 <- ggplot(hm, aes(bin_start, cell, fill = value)) + geom_raster() +
+    facet_grid(sample ~ chr, scales = "free", space = "free") +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-1, 1),
+                         oob = scales::squish, name = "log2 ratio") +
+    theme_void() + theme(strip.text.x = element_text(size = 5), strip.text.y = element_text(angle = 0, size = 7),
+                         panel.spacing = unit(0.05, "lines"))
+  ggsave(file.path(plot_dir, "08_cnv_cells_heatmap.png"), p2, width = 14, height = 9, dpi = 200)
+
+  # Focal amplicon genes: fragments in +/- focal_window, relative to same-day reference
+  fg <- annotations[annotations$gene_name %in% focal_genes & annotations$type == "gene"]
+  if (length(fg) == 0) fg <- annotations[annotations$gene_name %in% focal_genes]
+  fg_reg <- unlist(range(split(fg, fg$gene_name)))
+  fg_reg <- resize(fg_reg, width = width(fg_reg) + 2 * focal_window, fix = "center")
+  fc <- FeatureMatrix(fragments = Fragments(atac), features = fg_reg, cells = colnames(atac))
+  rownames(fc) <- names(fg_reg)
+  fcpm <- t(t(as.matrix(fc)) / atac$passed_filters) * 1e6
+  for (g in rownames(fcpm)) {
+    v <- rep(NA_real_, ncol(atac))
+    for (tp in tp_order) {
+      in_tp <- atac$timepoint == tp
+      ref <- in_tp & atac$cell_line == line_order[1]
+      v[in_tp] <- log2((fcpm[g, in_tp] + 1) / (mean(fcpm[g, ref]) + 1))
+    }
+    atac[[paste0("cnv_atac_", g)]] <- v
+  }
+  focal_cols <- grep("^cnv_atac_", colnames(atac@meta.data), value = TRUE)
+  p3 <- atac@meta.data[, c("sample", "cell_line", focal_cols)] %>%
+    tidyr::pivot_longer(all_of(focal_cols), names_to = "gene", values_to = "log2_ratio") %>%
+    ggplot(aes(sample, log2_ratio, fill = cell_line)) + geom_violin(scale = "width") +
+    geom_hline(yintercept = 0, linetype = "dashed") + facet_wrap(~ gene) +
+    theme_classic() + RotatedAxis() + labs(x = NULL, y = "log2 ratio vs reference (same day)")
+  ggsave(file.path(plot_dir, "08_cnv_focal_genes.pdf"), p3, width = 10, height = 4)
+  p3
+  FeaturePlot(atac, "cnv_score_atac", order = TRUE)
+}
+```
+
+# 10. Differentiating subset
+
+```{r diff-subset}
+diff_clusters <- pick_diff_clusters(atac, "atac_clusters")
+message("ATAC differentiating subset: clusters ", paste(diff_clusters, collapse = ", "))
+# Override after looking at 03_cluster_by_sample.pdf if needed
+atac$diff_subset <- atac$atac_clusters %in% diff_clusters
+
+atac_diff <- subset(atac, cells = colnames(atac)[atac$diff_subset])
+atac_diff <- process_lsi_harmony(atac_diff)
+atac_diff <- FindClusters(atac_diff, algorithm = 3, resolution = cluster_resolution, verbose = FALSE)
+atac_diff$sub_clusters <- atac_diff$seurat_clusters
+Idents(atac_diff) <- "sub_clusters"
+p <- DimPlot(atac_diff, group.by = c("sub_clusters", "cell_line", "timepoint"), label = TRUE, ncol = 3)
+ggsave(file.path(plot_dir, "09_diff_UMAP.pdf"), p, width = 18, height = 5)
+p
+
+da_diff <- FindAllMarkers(atac_diff, only.pos = TRUE, test.use = "LR", latent.vars = "nCount_peaks",
+                          min.pct = 0.05, logfc.threshold = 0.25)
+cf <- ClosestFeature(atac_diff, regions = unique(da_diff$gene))
+da_diff <- left_join(da_diff, cf[, c("query_region", "gene_name", "distance")], by = c("gene" = "query_region"))
+write.csv(da_diff, file.path(res_dir, "DA_peaks_diff_subclusters.csv"), row.names = FALSE)
+
+mon_d <- run_monocle3(atac_diff, assay = "peaks", cluster_col = "sub_clusters", out_col = "atac_pseudotime")
+atac_diff <- mon_d$obj
+```
+
+# 11. Save
+
+```{r save}
+saveRDS(atac,      file.path(res_dir, "atac_combined.rds"))
+saveRDS(atac_diff, file.path(res_dir, "atac_combined_diff.rds"))
+sessionInfo()
+```
