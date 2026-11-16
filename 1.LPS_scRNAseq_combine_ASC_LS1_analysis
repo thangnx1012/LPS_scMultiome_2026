@@ -1,0 +1,820 @@
+---
+title: "Combined scRNA-seq: LS1 + ASC, Day0 / Day1 / Day3"
+author: "Thang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+<!--
+Design
+  6 samples = 2 cell lines (LS1, ASC) x 3 time points (Day0, Day1, Day3); Day2 excluded.
+  - QC and doublets per sample, with QC thresholds per cell line.
+  - Two views of the data:
+      A. merged, no correction  -> how different are the cell lines?
+      B. Harmony integration across CELL LINE only (never across time point)
+         -> shared states, so the two lines can be compared state by state.
+  - Shared clusters, markers (conserved + line-specific), within-line DE over time,
+    comparison of the differentiation response between lines.
+  - Shared pseudotime: does each line progress equally far?
+  - Differentiating subset (re-integrated).
+  - RNA velocity separately per cell line, shown on the shared UMAP.
+
+Packages: Seurat (v5), harmony, scDblFinder, SingleCellExperiment, monocle3,
+  ggrepel, dplyr, ggplot2, metap (for FindConservedMarkers),
+  velociraptor + LoomExperiment (velocity, optional)
+  install.packages(c("harmony", "ggrepel", "metap"))
+  BiocManager::install(c("scDblFinder", "velociraptor", "LoomExperiment"))
+  remotes::install_github("cole-trapnell-lab/monocle3")
+  Download and run the JAGS macOS installer (.pkg) from SourceForge: https://sourceforge.net/projects/mcmc-jags/files/JAGS/
+  install.packages("rjags") for inferCNV
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 5)
+
+suppressPackageStartupMessages({
+  library("Seurat")
+  library("SingleCellExperiment")
+  library("scDblFinder")
+  library("harmony")
+  library("ggplot2")
+  library("ggrepel")
+  library("dplyr")
+  library("infercnv")
+  library("rjags")
+})
+set.seed(1234)
+
+```
+
+# Settings
+
+```{r settings}
+root_dir <- rprojroot::find_root(rprojroot::has_dir("LPS_ASC_diff"))
+rna_dir  <- file.path(root_dir, "LPS_ASC_diff", "scRNAseq")
+plot_dir <- file.path(rna_dir, "Plot_combined")
+res_dir  <- file.path(rna_dir, "Results_combined")
+vel_plot_dir <- file.path(plot_dir, "velocity")
+vel_res_dir  <- file.path(res_dir, "velocity")
+for (d in c(plot_dir, res_dir, vel_plot_dir, vel_res_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+tp_order   <- c("Day0", "Day1", "Day3")      # Day2 excluded
+line_order <- c("ASC", "LS1")                # first = reference line for comparisons
+
+samples <- expand.grid(timepoint = tp_order, cell_line = line_order, stringsAsFactors = FALSE)
+samples$sample <- paste0(samples$cell_line, "_", samples$timepoint)   # e.g. LS1_Day0, ASC_Day3
+samples$dir    <- file.path(rna_dir, samples$sample)
+samples$h5     <- file.path(samples$dir, "filtered_feature_bc_matrix.h5")
+samples$loom   <- file.path(samples$dir, "velocyto", paste0(samples$sample, ".loom"))
+samples
+stopifnot(all(file.exists(samples$h5)))
+
+# QC thresholds per cell line. Both lines have very similar QC, so they share
+# one set; 2500 genes sits in the dip that separates the low-quality cells.
+qc_thr <- list(LS1 = c(min_feature = 2500, min_count = 5000, max_mt = 10),
+               ASC = c(min_feature = 2500, min_count = 5000, max_mt = 10))
+
+n_pcs <- 30
+cluster_resolution <- 0.4
+# Cell lines cycle; CC.Difference removes S vs G2M but keeps cycling vs non-cycling
+regress_vars <- c("percent.mt", "CC.Difference")
+run_velocity <- TRUE
+
+# Known genes to follow (fill in: undifferentiated + differentiation markers)
+check_genes <- c()
+```
+
+# Helper functions
+
+```{r helpers}
+composition_table <- function(obj, cluster_col, group_col = "timepoint") {
+  prop.table(table(cluster = obj@meta.data[[cluster_col]],
+                   group = obj@meta.data[[group_col]]), margin = 1)
+}
+
+plot_composition <- function(obj, cluster_col, group_col, file) {
+  df <- as.data.frame(table(cluster = obj@meta.data[[cluster_col]],
+                            group = obj@meta.data[[group_col]]))
+  p <- ggplot(df, aes(cluster, Freq, fill = group)) + geom_col(position = "fill") +
+    labs(x = "Cluster", y = "Fraction of cells", fill = group_col) + theme_classic()
+  ggsave(file, p, width = 8, height = 4)
+  p
+}
+
+pick_root_cluster <- function(obj, cluster_col, root_tp = "Day0", min_cells = 50) {
+  prop <- composition_table(obj, cluster_col)
+  n  <- table(obj@meta.data[[cluster_col]])
+  ok <- names(n)[n >= min_cells]
+  ok[which.max(prop[ok, root_tp])]
+}
+
+pick_diff_clusters <- function(obj, cluster_col, root_tp = "Day0", max_root_frac = 0.5) {
+  prop <- composition_table(obj, cluster_col)
+  unique(c(pick_root_cluster(obj, cluster_col, root_tp),
+           rownames(prop)[prop[, root_tp] < max_root_frac]))
+}
+
+# Monocle3 on an existing UMAP (no SeuratWrappers needed)
+run_monocle3 <- function(obj, cluster_col, out_col, reduction = "umap", root_tp = "Day0") {
+  counts <- GetAssayData(obj, assay = "RNA", layer = "counts")
+  cds <- monocle3::new_cell_data_set(
+    expression_data = counts,
+    cell_metadata   = obj@meta.data[colnames(counts), , drop = FALSE],
+    gene_metadata   = data.frame(gene_short_name = rownames(counts), row.names = rownames(counts)))
+  SingleCellExperiment::reducedDim(cds, "UMAP") <- Embeddings(obj, reduction)[colnames(cds), ]
+  cds <- monocle3::cluster_cells(cds, reduction_method = "UMAP")
+  cds <- monocle3::learn_graph(cds, use_partition = FALSE)
+  root_cl <- pick_root_cluster(obj, cluster_col, root_tp)
+  root_cells <- colnames(obj)[obj@meta.data[[cluster_col]] == root_cl & obj$timepoint == root_tp]
+  message("Monocle3 root: cluster ", root_cl, " (", length(root_cells), " cells)")
+  cds <- monocle3::order_cells(cds, root_cells = root_cells)
+  pt <- monocle3::pseudotime(cds)[colnames(obj)]
+  pt[is.infinite(pt)] <- NA
+  obj[[out_col]] <- pt
+  list(obj = obj, cds = cds)
+}
+
+# Harmony integration across cell lines on a (sub)set of cells
+integrate_by_line <- function(obj) {
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  obj[["RNA"]] <- split(obj[["RNA"]], f = obj$cell_line)
+  obj <- FindVariableFeatures(obj, nfeatures = 2000)      # per line, then combined ranking
+  obj <- ScaleData(obj, vars.to.regress = regress_vars)
+  obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+  obj <- IntegrateLayers(obj, method = HarmonyIntegration, orig.reduction = "pca",
+                         new.reduction = "harmony", verbose = FALSE)
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  obj
+}
+
+# --- velocity helpers ---
+# velocyto barcode "LS1_Day0:AAACCTGAGAAGGCCTx" -> Seurat "LS1_Day0_AAACCTGAGAAGGCCT-1"
+read_loom <- function(path, prefix) {
+  le <- LoomExperiment::import(path, type = "SingleCellLoomExperiment")
+  bc <- sub("x$", "", sub(".*:", "", colData(le)$CellID))
+  cn <- paste0(prefix, "_", bc, "-1")
+  rn <- make.unique(as.character(rowData(le)$Gene))
+  get <- function(a) { m <- as(assay(le, a), "dgCMatrix"); dimnames(m) <- list(rn, cn); m }
+  list(spliced = get("spliced"), unspliced = get("unspliced"))
+}
+
+load_looms <- function(files) {        # named vector: sample -> loom path
+  parts <- lapply(names(files), function(s) read_loom(files[[s]], s))
+  genes <- Reduce(intersect, lapply(parts, function(x) rownames(x$spliced)))
+  list(spliced   = do.call(cbind, lapply(parts, function(x) x$spliced[genes, ])),
+       unspliced = do.call(cbind, lapply(parts, function(x) x$unspliced[genes, ])))
+}
+
+run_velocity_line <- function(obj, loom, cluster_col, tag, dimred = "harmony") {
+  cells <- intersect(colnames(obj), colnames(loom$spliced))
+  message("[velocity ", tag, "] matched ", length(cells), " / ", ncol(obj), " cells")
+  if (length(cells) < 0.5 * ncol(obj)) stop("Barcode mismatch between Seurat and loom")
+  genes <- intersect(rownames(obj), rownames(loom$spliced))
+  sce <- SingleCellExperiment(
+    assays = list(counts    = GetAssayData(obj, assay = "RNA", layer = "counts")[genes, cells],
+                  spliced   = loom$spliced[genes, cells],
+                  unspliced = loom$unspliced[genes, cells]),
+    colData = obj@meta.data[cells, ])
+  reducedDim(sce, "PCA")  <- Embeddings(obj, dimred)[cells, 1:n_pcs]
+  reducedDim(sce, "UMAP") <- Embeddings(obj, "umap")[cells, ]
+  velo <- velociraptor::scvelo(sce, assay.X = "counts",
+                               subset.row = intersect(VariableFeatures(obj), genes),
+                               use.dimred = "PCA", mode = "dynamical")
+  cd <- colData(velo)
+  out <- data.frame(row.names = cells,
+                    rna_latent_time = if ("latent_time" %in% colnames(cd)) cd$latent_time else NA,
+                    rna_velocity_pseudotime = cd$velocity_pseudotime)
+  emb <- velociraptor::embedVelocity(reducedDim(sce, "UMAP"), velo)[, 1:2]
+  for (key in c(cluster_col, "timepoint")) {
+    p <- velociraptor::plotVelocityStream(sce, emb, use.dimred = "UMAP", color_by = key) +
+      ggtitle(paste("RNA velocity -", tag, "-", key))
+    ggsave(file.path(vel_plot_dir, paste0("stream_", tag, "_", key, ".pdf")), p, width = 7, height = 6)
+  }
+  if ("fit_likelihood" %in% colnames(rowData(velo))) {
+    drivers <- data.frame(gene = rownames(velo), fit_likelihood = rowData(velo)$fit_likelihood) %>%
+      filter(!is.na(fit_likelihood)) %>% arrange(desc(fit_likelihood))
+    write.csv(drivers, file.path(vel_res_dir, paste0("driver_genes_", tag, ".csv")), row.names = FALSE)
+  }
+  out
+}
+
+```
+
+# 1. Read, QC, doublets
+```{r read-qc}
+rna_list <- lapply(seq_len(nrow(samples)), function(i) {
+  x <- Read10X_h5(samples$h5[i])
+  if (is.list(x)) x <- x[["Gene Expression"]]
+  obj <- CreateSeuratObject(counts = x, project = samples$sample[i], min.cells = 3, min.features = 200)
+  obj$sample    <- samples$sample[i]
+  obj$cell_line <- samples$cell_line[i]
+  obj$timepoint <- samples$timepoint[i]
+  obj$percent.mt   <- PercentageFeatureSet(obj, pattern = "^MT-")
+  obj$percent.ribo <- PercentageFeatureSet(obj, pattern = "^RP[SL]")
+  obj
+})
+rna <- merge(rna_list[[1]], y = rna_list[-1], add.cell.ids = samples$sample)
+rna <- JoinLayers(rna)
+rm(rna_list); invisible(gc())
+
+rna$sample    <- factor(rna$sample, levels = samples$sample)
+rna$cell_line <- factor(rna$cell_line, levels = line_order)
+rna$timepoint <- factor(rna$timepoint, levels = tp_order)
+
+p <- VlnPlot(rna, c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+             group.by = "sample", pt.size = 0, ncol = 4, log = FALSE) & RotatedAxis()
+ggsave(file.path(plot_dir, "01_QC_violin.pdf"), p, width = 16, height = 5)
+p
+
+# Per-cell-line thresholds
+thr <- do.call(rbind, qc_thr)[as.character(rna$cell_line), ]
+keep <- rna$nFeature_RNA > thr[, "min_feature"] & rna$nCount_RNA > thr[, "min_count"] &
+        rna$percent.mt < thr[, "max_mt"]
+print(table(rna$sample, keep))
+rna <- subset(rna, cells = colnames(rna)[keep])
+
+dbl <- scDblFinder(GetAssayData(rna, assay = "RNA", layer = "counts"), samples = rna$sample)
+rna$doublet_class <- dbl$scDblFinder.class
+rna$doublet_score <- dbl$scDblFinder.score
+print(table(rna$sample, rna$doublet_class))
+rna <- subset(rna, doublet_class == "singlet")
+```
+
+# 2. Normalisation, cell cycle, unintegrated view
+```{r normalise}
+rna <- NormalizeData(rna)
+rna <- CellCycleScoring(rna, s.features = cc.genes.updated.2019$s.genes,
+                        g2m.features = cc.genes.updated.2019$g2m.genes)
+rna$CC.Difference <- rna$S.Score - rna$G2M.Score
+
+# A. No correction: how different are the lines?
+rna <- FindVariableFeatures(rna, nfeatures = 2000)
+rna <- ScaleData(rna, vars.to.regress = regress_vars)
+rna <- RunPCA(rna, npcs = 50, verbose = FALSE)
+rna <- RunUMAP(rna, dims = 1:n_pcs, reduction = "pca",
+               reduction.name = "umap.unintegrated", verbose = FALSE)
+p <- DimPlot(rna, reduction = "umap.unintegrated", group.by = c("cell_line", "timepoint", "Phase"), ncol = 3)
+ggsave(file.path(plot_dir, "02_UMAP_unintegrated.pdf"), p, width = 18, height = 5)
+p
+```
+
+## Sample check (6 samples)
+Within each line the order should be Day0 → Day1 → Day3.
+```{r sample-check}
+pb_counts <- AggregateExpression(rna, group.by = "sample", assays = "RNA")$RNA
+colnames(pb_counts) <- gsub("-", "_", colnames(pb_counts))     # Seurat turns "_" into "-"
+pb_counts <- pb_counts[, samples$sample]
+pb_log2 <- log2(t(t(pb_counts) / colSums(pb_counts)) * 1e6 + 1)
+hv <- intersect(VariableFeatures(rna), rownames(pb_log2))
+
+cor_mat <- cor(as.matrix(pb_log2[hv, ]))
+write.csv(cor_mat, file.path(res_dir, "sample_pseudobulk_correlation.csv"))
+p1 <- ggplot(as.data.frame(as.table(cor_mat)), aes(Var1, Var2, fill = Freq)) + geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3) + scale_fill_viridis_c(name = "r") +
+  labs(x = NULL, y = NULL) + theme_minimal() + RotatedAxis()
+
+pca_pb <- prcomp(t(as.matrix(pb_log2[hv, ])), scale. = TRUE)
+pc_df  <- cbind(as.data.frame(pca_pb$x[, 1:2]), samples)
+p2 <- ggplot(pc_df, aes(PC1, PC2, colour = cell_line, label = timepoint)) +
+  geom_path(aes(group = cell_line), arrow = arrow(length = unit(0.2, "cm"))) +
+  geom_point(size = 3) + geom_text_repel() + theme_classic()
+ggsave(file.path(plot_dir, "02_sample_correlation.pdf"), p1, width = 6, height = 5)
+ggsave(file.path(plot_dir, "02_sample_pseudobulk_PCA.pdf"), p2, width = 6, height = 5)
+p1 + p2
+
+qc_by_sample <- rna@meta.data %>% group_by(sample) %>%
+  summarise(n_cells = n(), median_nCount = median(nCount_RNA), median_nFeature = median(nFeature_RNA),
+            median_pct_mt = median(percent.mt), pct_G1 = round(100 * mean(Phase == "G1"), 1))
+write.csv(qc_by_sample, file.path(res_dir, "qc_by_sample.csv"), row.names = FALSE)
+knitr::kable(qc_by_sample)
+```
+
+# 3. Integration across cell lines (Harmony)
+Only cell line is corrected. Time point is left alone because it is the biology.
+```{r integrate}
+rna <- integrate_by_line(rna)
+rna <- FindNeighbors(rna, reduction = "harmony", dims = 1:n_pcs)
+for (r in c(0.2, 0.4, 0.6, 0.8)) rna <- FindClusters(rna, resolution = r, verbose = FALSE)
+rna$rna_clusters <- rna@meta.data[[paste0("RNA_snn_res.", cluster_resolution)]]
+Idents(rna) <- "rna_clusters"
+rna <- RunUMAP(rna, reduction = "harmony", dims = 1:n_pcs, reduction.name = "umap", verbose = FALSE)
+
+p <- DimPlot(rna, group.by = c("rna_clusters", "cell_line", "timepoint", "Phase"), label = TRUE, ncol = 4)
+ggsave(file.path(plot_dir, "03_UMAP_integrated.pdf"), p, width = 22, height = 5)
+p
+p <- DimPlot(rna, group.by = "timepoint", split.by = "cell_line", ncol = 2)
+ggsave(file.path(plot_dir, "03_UMAP_integrated_split_by_line.pdf"), p, width = 12, height = 5)
+p
+
+# Which states are shared and which are line-specific?
+rna$group <- factor(paste(rna$cell_line, rna$timepoint, sep = "_"), levels = samples$sample)
+p1 <- plot_composition(rna, "rna_clusters", "cell_line", file.path(plot_dir, "03_cluster_by_line.pdf"))
+p2 <- plot_composition(rna, "rna_clusters", "group",     file.path(plot_dir, "03_cluster_by_sample.pdf"))
+p1 + p2
+write.csv(as.data.frame.matrix(table(rna$rna_clusters, rna$group)),
+          file.path(res_dir, "cluster_counts_by_sample.csv"))
+```
+
+# 4. Markers
+```{r markers}
+markers <- FindAllMarkers(rna, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(markers, file.path(res_dir, "markers_clusters.csv"), row.names = FALSE)
+top5 <- markers %>% filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 5)
+p <- DotPlot(rna, features = unique(top5$gene)) + RotatedAxis()
+ggsave(file.path(plot_dir, "04_markers_dotplot.pdf"), p, width = 18, height = 6)
+p
+
+# Markers shared by both lines within each cluster (needs cells from both lines)
+if (requireNamespace("metap", quietly = TRUE)) {
+  both <- names(which(apply(table(rna$rna_clusters, rna$cell_line) >= 20, 1, all)))
+  cons <- bind_rows(lapply(both, function(cl) {
+    FindConservedMarkers(rna, ident.1 = cl, grouping.var = "cell_line", only.pos = TRUE,
+                         min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE) %>%
+      mutate(gene = rownames(.), cluster = cl)
+  }))
+  write.csv(cons, file.path(res_dir, "markers_conserved_across_lines.csv"), row.names = FALSE)
+}
+
+if (length(intersect(check_genes, rownames(rna))) > 0) {
+  p <- DotPlot(rna, features = intersect(check_genes, rownames(rna)), group.by = "group") + RotatedAxis()
+  ggsave(file.path(plot_dir, "04_known_markers_by_sample.pdf"), p, width = 10, height = 4)
+  p
+}
+rna$celltype <- paste0("RNA_c", rna$rna_clusters)   # rename after annotation
+```
+
+
+# 5. Differentiation response: DEGs between days within each line
+```{r de-time}
+# (a) Within-line DE over time (cell-level Wilcoxon; one sample per condition,
+#     so treat p-values as a ranking)
+Idents(rna) <- "group"
+cmp <- expand.grid(line = line_order, pair = c("Day1_vs_Day0", "Day3_vs_Day0", "Day3_vs_Day1"),
+                   stringsAsFactors = FALSE)
+de_time <- bind_rows(lapply(seq_len(nrow(cmp)), function(i) {
+  tp <- strsplit(cmp$pair[i], "_vs_")[[1]]
+  FindMarkers(rna, ident.1 = paste(cmp$line[i], tp[1], sep = "_"),
+              ident.2 = paste(cmp$line[i], tp[2], sep = "_"), logfc.threshold = 0.25) %>%
+    mutate(gene = rownames(.), cell_line = cmp$line[i], comparison = cmp$pair[i])
+}))
+Idents(rna) <- "rna_clusters"
+
+# (b) DEG plots per line: Day1 vs Day0, Day3 vs Day0, Day3 vs Day1
+deg_padj <- 0.05      # adjusted p-value cutoff
+deg_lfc  <- 0.5       # |log2 fold change| cutoff
+n_label  <- 10        # genes labelled per direction in each volcano
+
+de_time <- de_time %>%
+  mutate(comparison = factor(comparison, levels = c("Day1_vs_Day0", "Day3_vs_Day0", "Day3_vs_Day1")),
+         cell_line  = factor(cell_line, levels = line_order),
+         direction  = case_when(p_val_adj < deg_padj & avg_log2FC >  deg_lfc ~ "up",
+                                p_val_adj < deg_padj & avg_log2FC < -deg_lfc ~ "down",
+                                TRUE ~ "ns"),
+         neg_log10_padj = pmin(-log10(p_val_adj + 1e-300), 300))
+write.csv(de_time, file.path(res_dir, "DE_time_within_line.csv"), row.names = FALSE)
+
+# Number of DEGs per comparison
+deg_n <- de_time %>% filter(direction != "ns") %>% count(cell_line, comparison, direction)
+p <- ggplot(deg_n, aes(comparison, ifelse(direction == "up", n, -n), fill = direction)) +
+  geom_col() + geom_hline(yintercept = 0) +
+  geom_text(aes(label = n, vjust = ifelse(direction == "up", -0.3, 1.2)), size = 3) +
+  facet_wrap(~ cell_line) +
+  scale_fill_manual(values = c(up = "#B2182B", down = "#2166AC")) +
+  labs(x = NULL, y = "Number of DEGs (down < 0 < up)", fill = NULL,
+       subtitle = sprintf("padj < %s, |log2FC| > %s", deg_padj, deg_lfc)) +
+  theme_classic()
+ggsave(file.path(plot_dir, "05_DEG_counts.pdf"), p, width = 9, height = 4.5)
+p
+
+# Volcano plots: rows = cell line, columns = comparison
+lab <- de_time %>% filter(direction != "ns") %>%
+  group_by(cell_line, comparison, direction) %>% slice_max(abs(avg_log2FC), n = n_label)
+p <- ggplot(de_time, aes(avg_log2FC, neg_log10_padj, colour = direction)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  geom_vline(xintercept = c(-deg_lfc, deg_lfc), linetype = "dashed", colour = "grey60") +
+  geom_hline(yintercept = -log10(deg_padj), linetype = "dashed", colour = "grey60") +
+  geom_text_repel(data = lab, aes(label = gene), size = 2.3, max.overlaps = Inf,
+                  min.segment.length = 0, segment.size = 0.2, show.legend = FALSE) +
+  facet_grid(cell_line ~ comparison) +
+  scale_colour_manual(values = c(up = "#B2182B", down = "#2166AC", ns = "grey75")) +
+  labs(x = "log2 fold change", y = "-log10 adjusted p", colour = NULL) +
+  theme_bw() + theme(panel.grid = element_blank(), strip.background = element_blank(),
+                     strip.text = element_text(face = "bold"))
+ggsave(file.path(plot_dir, "05_DEG_volcano.pdf"), p, width = 14, height = 9)
+p
+
+# Heatmap per line: top DEGs from all three comparisons, mean expression per day
+# (z-score across Day0/Day1/Day3), genes grouped by the day they peak
+for (ln in line_order) {
+  top <- de_time %>% filter(cell_line == ln, direction != "ns") %>%
+    group_by(comparison, direction) %>% slice_max(abs(avg_log2FC), n = 15) %>% pull(gene) %>% unique()
+  if (length(top) < 2) next
+  cols <- paste0(ln, "_", tp_order)
+  m <- pb_log2[intersect(top, rownames(pb_log2)), cols, drop = FALSE]
+  m <- t(scale(t(m))); m[is.na(m)] <- 0
+  colnames(m) <- tp_order
+  peak <- factor(tp_order[apply(m, 1, which.max)], levels = tp_order)
+  ord <- order(peak, -apply(m, 1, max))
+  df <- as.data.frame(as.table(m[ord, , drop = FALSE])); colnames(df) <- c("gene", "day", "z")
+  df$gene <- factor(df$gene, levels = rev(rownames(m)[ord]))
+  df$peak <- paste("highest at", peak[match(df$gene, rownames(m))])
+  p <- ggplot(df, aes(day, gene, fill = z)) + geom_tile() +
+    facet_grid(peak ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "z-score") +
+    labs(x = NULL, y = NULL, title = paste(ln, "- top DEGs across days")) + theme_minimal() +
+    theme(axis.text.y = element_text(size = 6), strip.text.y = element_text(angle = 0))
+  ggsave(file.path(plot_dir, paste0("05_DEG_heatmap_", ln, ".pdf")), p,
+         width = 4.5, height = 2 + 0.12 * nrow(m), limitsize = FALSE)
+  print(p)
+}
+```
+
+# 5b. Markers for each day of differentiation
+
+Three questions:
+(a) Which genes mark each day (that day vs the other days), in each line?
+(b) Which day markers are shared by both lines?
+(c) Which cell states (clusters) are present on each day, and what marks them?
+
+Each day is a single sample, so day markers can also carry sample-level technical
+differences. Markers found in both lines (b) are the most trustworthy.
+
+```{r day-markers, fig.height = 6}
+# (a) Day markers within each line
+day_markers <- bind_rows(lapply(line_order, function(ln) {
+  obj <- subset(rna, cells = colnames(rna)[rna$cell_line == ln])
+  Idents(obj) <- "timepoint"
+  FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE) %>%
+    rename(timepoint = cluster) %>% mutate(cell_line = ln)
+}))
+write.csv(day_markers, file.path(res_dir, "markers_day_within_line.csv"), row.names = FALSE)
+day_markers %>% filter(p_val_adj < 0.05, avg_log2FC > 1) %>% count(cell_line, timepoint) %>% knitr::kable()
+
+# (b) Day markers conserved in both lines
+if (requireNamespace("metap", quietly = TRUE)) {
+  Idents(rna) <- "timepoint"
+  day_cons <- bind_rows(lapply(tp_order, function(tp) {
+    FindConservedMarkers(rna, ident.1 = tp, grouping.var = "cell_line", only.pos = TRUE,
+                         min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE) %>%
+      mutate(gene = rownames(.), timepoint = tp)
+  }))
+  Idents(rna) <- "rna_clusters"
+  fc_cols <- paste0(line_order, "_avg_log2FC")
+  day_cons$mean_log2FC <- rowMeans(day_cons[, fc_cols])
+  day_cons <- day_cons %>% arrange(timepoint, desc(mean_log2FC))
+  write.csv(day_cons, file.path(res_dir, "markers_day_conserved_across_lines.csv"), row.names = FALSE)
+}
+
+# Top markers per day (per line), shown on all 6 samples
+top_day <- day_markers %>% filter(p_val_adj < 0.05) %>%
+  group_by(cell_line, timepoint) %>% slice_max(avg_log2FC, n = 8) %>% ungroup() %>%
+  arrange(timepoint) %>% distinct(gene, .keep_all = TRUE)
+p <- DotPlot(rna, features = unique(top_day$gene), group.by = "group") + RotatedAxis()
+ggsave(file.path(plot_dir, "05b_day_markers_dotplot.pdf"), p, width = 4 + 0.25 * nrow(top_day), height = 4)
+p
+
+# Pseudobulk heatmap of the same genes (z-score across the 6 samples)
+hm <- pb_log2[intersect(top_day$gene, rownames(pb_log2)), samples$sample, drop = FALSE]
+hm <- t(scale(t(hm))); hm[is.na(hm)] <- 0
+hm_df <- as.data.frame(as.table(hm)); colnames(hm_df) <- c("gene", "sample", "z")
+hm_df$gene <- factor(hm_df$gene, levels = rev(rownames(hm)))
+hm_df$day_marker_of <- top_day$timepoint[match(hm_df$gene, top_day$gene)]
+p <- ggplot(hm_df, aes(sample, gene, fill = z)) + geom_tile() +
+  facet_grid(day_marker_of ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "z-score") +
+  labs(x = NULL, y = NULL) + theme_minimal() + RotatedAxis() +
+  theme(axis.text.y = element_text(size = 6))
+ggsave(file.path(plot_dir, "05b_day_markers_pseudobulk_heatmap.pdf"), p,
+       width = 6, height = 2 + 0.12 * nrow(hm), limitsize = FALSE)
+p
+
+# (c) Cell states on each day: composition and cluster markers within each day
+comp <- as.data.frame(table(cluster = rna$rna_clusters, group = rna$group))
+p1 <- ggplot(comp, aes(group, Freq, fill = cluster)) + geom_col(position = "fill") +
+  labs(x = NULL, y = "Fraction of cells", fill = "Cluster") + theme_classic() + RotatedAxis()
+p2 <- DimPlot(rna, group.by = "rna_clusters", split.by = "timepoint", label = TRUE) + NoLegend()
+ggsave(file.path(plot_dir, "05b_clusters_per_day_composition.pdf"), p1, width = 6, height = 4.5)
+ggsave(file.path(plot_dir, "05b_clusters_split_by_day_UMAP.pdf"), p2, width = 15, height = 5)
+p1
+p2
+
+min_cells_cluster <- 30
+cl_by_day <- bind_rows(lapply(tp_order, function(tp) {
+  obj <- subset(rna, cells = colnames(rna)[rna$timepoint == tp])
+  big <- names(which(table(obj$rna_clusters) >= min_cells_cluster))
+  if (length(big) < 2) return(NULL)
+  obj <- subset(obj, cells = colnames(obj)[obj$rna_clusters %in% big])
+  obj$cl_day <- droplevels(factor(obj$rna_clusters))
+  Idents(obj) <- "cl_day"
+  FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE) %>%
+    mutate(timepoint = tp)
+}))
+write.csv(cl_by_day, file.path(res_dir, "markers_clusters_within_each_day.csv"), row.names = FALSE)
+
+pdf(file.path(plot_dir, "05b_cluster_markers_within_each_day.pdf"), width = 16, height = 5)
+for (tp in unique(cl_by_day$timepoint)) {
+  top <- cl_by_day %>% filter(timepoint == tp, p_val_adj < 0.05) %>%
+    group_by(cluster) %>% slice_max(avg_log2FC, n = 5)
+  obj <- subset(rna, cells = colnames(rna)[rna$timepoint == tp &
+                                             rna$rna_clusters %in% unique(top$cluster)])
+  print(DotPlot(obj, features = unique(top$gene), group.by = "rna_clusters") +
+          RotatedAxis() + ggtitle(paste("Cluster markers within", tp)))
+}
+dev.off()
+```
+
+# 6. Trajectory per cell line
+
+Each line is re-processed on its own (its own variable genes, PCA, UMAP and clusters,
+no integration) and its trajectory is rooted at that line's own Day0 cells. Nothing
+forces the two lines onto a common path: the integrated UMAP aligns the lines by
+construction, so a shared starting point there is partly an effect of Harmony.
+`rna_pseudotime` is therefore only comparable within a line.
+
+```{r trajectory-per-line, fig.height = 5}
+process_line <- function(obj) {
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+  obj <- FindVariableFeatures(obj, nfeatures = 2000, verbose = FALSE)
+  obj <- ScaleData(obj, vars.to.regress = regress_vars, verbose = FALSE)
+  obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = 1:n_pcs, verbose = FALSE)
+  obj <- FindClusters(obj, resolution = cluster_resolution, verbose = FALSE)
+  obj$line_clusters <- obj$seurat_clusters
+  Idents(obj) <- "line_clusters"
+  RunUMAP(obj, dims = 1:n_pcs, reduction.name = "umap", verbose = FALSE)
+}
+
+# Genes x pseudotime-bin heatmap (z-scored), genes ordered by where they peak
+plot_pseudotime_heatmap <- function(obj, genes, time_col, title, n_bins = 50) {
+  t  <- obj@meta.data[[time_col]]; ok <- !is.na(t)
+  ex <- as.matrix(GetAssayData(obj, assay = "RNA", layer = "data")[genes, ok, drop = FALSE])
+  bins <- cut(rank(t[ok], ties.method = "first"), n_bins, labels = FALSE)
+  m <- vapply(seq_len(n_bins), function(b) rowMeans(ex[, bins == b, drop = FALSE]), numeric(length(genes)))
+  m <- matrix(m, nrow = length(genes), dimnames = list(genes, seq_len(n_bins)))
+  m <- t(scale(t(m))); m[is.na(m)] <- 0
+  m <- m[order(apply(m, 1, which.max)), , drop = FALSE]
+  df <- as.data.frame(as.table(m)); colnames(df) <- c("gene", "bin", "z")
+  df$gene <- factor(df$gene, levels = rev(rownames(m)))
+  ggplot(df, aes(as.numeric(bin), gene, fill = z)) + geom_raster() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "z-score") +
+    labs(x = "Pseudotime (binned)", y = NULL, title = title) + theme_minimal() +
+    theme(axis.text.y = element_text(size = 5))
+}
+
+rna_lines <- list(); cds_lines <- list()
+rna$rna_pseudotime <- NA_real_
+rna$line_clusters  <- NA_character_
+
+for (ln in line_order) {
+  obj <- process_line(subset(rna, cells = colnames(rna)[rna$cell_line == ln]))
+  mon <- run_monocle3(obj, cluster_col = "line_clusters", out_col = "rna_pseudotime")
+  obj <- mon$obj
+
+  p1 <- DimPlot(obj, group.by = c("line_clusters", "timepoint", "Phase"), label = TRUE, ncol = 3)
+  p2 <- monocle3::plot_cells(mon$cds, color_cells_by = "pseudotime", label_branch_points = TRUE,
+                             label_roots = TRUE, label_leaves = TRUE) + ggtitle(paste(ln, "trajectory"))
+  p3 <- ggplot(obj@meta.data, aes(timepoint, rna_pseudotime, fill = timepoint)) +
+    geom_violin(scale = "width") + geom_boxplot(width = 0.15, outlier.shape = NA) +
+    theme_classic() + NoLegend() + labs(x = NULL, y = "Pseudotime", title = ln)
+  ggsave(file.path(plot_dir, paste0("06_", ln, "_UMAP.pdf")), p1, width = 18, height = 5)
+  ggsave(file.path(plot_dir, paste0("06_", ln, "_trajectory.pdf")), p2 + p3, width = 12, height = 5)
+  print(p1); print(p2 + p3)
+  plot_composition(obj, "line_clusters", "timepoint", file.path(plot_dir, paste0("06_", ln, "_cluster_by_day.pdf")))
+
+  markers_ln <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, verbose = FALSE)
+  write.csv(markers_ln, file.path(res_dir, paste0("markers_", ln, "_line_clusters.csv")), row.names = FALSE)
+
+  # Genes that change along this line's trajectory (tested on the line's variable genes)
+  pt_genes <- monocle3::graph_test(mon$cds[VariableFeatures(obj), ], neighbor_graph = "principal_graph", cores = 4)
+  pt_genes <- pt_genes[order(pt_genes$q_value, -pt_genes$morans_I), ]
+  write.csv(pt_genes, file.path(res_dir, paste0("pseudotime_genes_", ln, ".csv")))
+  sig <- rownames(subset(pt_genes, q_value < 0.05))
+  if (length(sig) >= 2) {
+    p <- plot_pseudotime_heatmap(obj, head(sig, 60), "rna_pseudotime", paste(ln, "- top pseudotime genes"))
+    ggsave(file.path(plot_dir, paste0("06_", ln, "_pseudotime_heatmap.pdf")), p, width = 7, height = 8)
+    print(p)
+    p <- monocle3::plot_genes_in_pseudotime(mon$cds[head(sig, 8), ], color_cells_by = "timepoint", ncol = 2)
+    ggsave(file.path(plot_dir, paste0("06_", ln, "_genes_in_pseudotime.pdf")), p, width = 9, height = 10)
+  }
+
+  # Copy back to the combined object
+  rna$rna_pseudotime[match(colnames(obj), colnames(rna))] <- obj$rna_pseudotime
+  rna$line_clusters[match(colnames(obj), colnames(rna))]  <- paste0(ln, "_c", obj$line_clusters)
+  rna_lines[[ln]] <- obj; cds_lines[[ln]] <- mon$cds
+}
+
+rna@meta.data %>% group_by(cell_line, timepoint) %>%
+  summarise(median_pseudotime = median(rna_pseudotime, na.rm = TRUE), .groups = "drop") %>%
+  knitr::kable()
+
+# Do the two lines start from a similar state? Pseudobulk correlation of the Day0
+# samples (variable genes; no integration involved)
+round(cor_mat[paste0(line_order, "_Day0"), ], 3)
+```
+
+
+# 7. Differentiating subset (re-integrated)
+```{r diff-subset}
+diff_clusters <- pick_diff_clusters(rna, "rna_clusters")
+message("Differentiating subset uses clusters: ", paste(diff_clusters, collapse = ", "))
+# Override after looking at 03_cluster_by_sample.pdf, e.g. diff_clusters <- c("0", "2", "5")
+rna$diff_subset <- rna$rna_clusters %in% diff_clusters
+
+rna_diff <- subset(rna, cells = colnames(rna)[rna$diff_subset])
+rna_diff <- integrate_by_line(rna_diff)
+rna_diff <- FindNeighbors(rna_diff, reduction = "harmony", dims = 1:n_pcs)
+rna_diff <- FindClusters(rna_diff, resolution = cluster_resolution, verbose = FALSE)
+rna_diff$sub_clusters <- rna_diff$seurat_clusters
+Idents(rna_diff) <- "sub_clusters"
+rna_diff <- RunUMAP(rna_diff, reduction = "harmony", dims = 1:n_pcs, reduction.name = "umap", verbose = FALSE)
+
+p <- DimPlot(rna_diff, group.by = c("sub_clusters", "cell_line", "timepoint"), label = TRUE, ncol = 3)
+ggsave(file.path(plot_dir, "07_diff_UMAP.pdf"), p, width = 18, height = 5)
+p
+plot_composition(rna_diff, "sub_clusters", "group", file.path(plot_dir, "07_diff_composition.pdf"))
+
+markers_diff <- FindAllMarkers(rna_diff, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(markers_diff, file.path(res_dir, "markers_diff_subclusters.csv"), row.names = FALSE)
+
+mon_d <- run_monocle3(rna_diff, cluster_col = "sub_clusters", out_col = "rna_pseudotime")
+rna_diff <- mon_d$obj
+p <- ggplot(rna_diff@meta.data, aes(timepoint, rna_pseudotime, fill = cell_line)) +
+  geom_violin(scale = "width", position = position_dodge(0.8)) + theme_classic()
+ggsave(file.path(plot_dir, "07_diff_pseudotime_by_line.pdf"), p, width = 6, height = 4)
+p
+
+pt_genes <- monocle3::graph_test(mon_d$cds, neighbor_graph = "principal_graph", cores = 4)
+pt_genes <- pt_genes[order(pt_genes$q_value, -pt_genes$morans_I), ]
+write.csv(pt_genes, file.path(res_dir, "diff_pseudotime_genes.csv"))
+```
+
+# 8. RNA velocity per cell line
+Fitted separately for each line (kinetics differ between lines) and drawn on the shared UMAP.
+Latent time is only comparable within a line.
+
+```{r velocity}
+vel_ok <- run_velocity &&
+  all(vapply(c("velociraptor", "LoomExperiment"), requireNamespace, logical(1), quietly = TRUE)) &&
+  all(file.exists(samples$loom))
+if (!vel_ok) message("Velocity skipped (packages or loom files missing)")
+
+if (vel_ok) {
+  for (ln in line_order) {
+    s_ln <- samples[samples$cell_line == ln, ]
+    loom <- load_looms(setNames(s_ln$loom, s_ln$sample))
+    for (obj_name in c("rna", "rna_diff")) {
+      obj <- get(obj_name)
+      sub <- subset(obj, cells = colnames(obj)[obj$cell_line == ln])
+      cl  <- if (obj_name == "rna") "rna_clusters" else "sub_clusters"
+      res <- tryCatch(run_velocity_line(sub, loom, cl, paste0(ln, "_", obj_name)),
+                      error = function(e) { warning(ln, " ", obj_name, ": ", conditionMessage(e)); NULL })
+      if (!is.null(res)) {
+        for (col in colnames(res)) {
+          v <- if (col %in% colnames(obj@meta.data)) obj@meta.data[[col]] else rep(NA_real_, ncol(obj))
+          names(v) <- colnames(obj); v[rownames(res)] <- res[[col]]
+          obj[[col]] <- v
+        }
+        assign(obj_name, obj)
+      }
+    }
+    rm(loom); invisible(gc())
+  }
+  if ("rna_latent_time" %in% colnames(rna@meta.data)) {
+    p <- ggplot(rna@meta.data, aes(timepoint, rna_latent_time, fill = cell_line)) +
+      geom_violin(scale = "width", position = position_dodge(0.8)) + theme_classic() +
+      labs(y = "Latent time (within line)")
+    ggsave(file.path(vel_plot_dir, "latent_time_by_line_timepoint.pdf"), p, width = 6, height = 4)
+    p
+  }
+}
+```
+
+# 9. Copy-number inference (inferCNV)
+ASC cells are the normal (diploid) reference, and LS1 cells are compared with them.
+Expression is averaged over about 100 neighbouring genes, so only large CNVs
+(roughly arm-level, or focal amplicons of several Mb) are detected.
+Uses: confirm LS1's expected CNVs, find LS1 subclones, and test whether a
+subclone differentiates differently.
+Requires `BiocManager::install("infercnv")`. The HMM step also needs JAGS
+installed on the system. Runtime is about 30–90 min.
+
+```{r infercnv, fig.height = 5}
+run_infercnv       <- TRUE
+cnv_reference_line <- "ASC"
+max_cells_per_sample <- 600      # downsampling keeps the runtime reasonable
+# Region to score separately: 12q13-15 (MDM2/CDK4/HMGA2), amplified in WD/DD
+# liposarcoma. Change it if LS1 is a different tumour type.
+roi <- list(name = "chr12q13-15", chr = "chr12", start = 57e6, end = 110e6)
+
+if (run_infercnv && requireNamespace("infercnv", quietly = TRUE) &&
+    requireNamespace("EnsDb.Hsapiens.v86", quietly = TRUE)) {
+  cnv_dir <- file.path(res_dir, "infercnv")
+  dir.create(cnv_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Gene positions (hg38, protein-coding)
+  g <- ensembldb::genes(EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86,
+                        filter = AnnotationFilter::GeneBiotypeFilter("protein_coding"))
+  chr_levels <- paste0("chr", c(1:22, "X"))
+  gpos <- data.frame(gene  = g$gene_name,
+                     chr   = paste0("chr", as.character(GenomicRanges::seqnames(g))),
+                     start = BiocGenerics::start(g), end = BiocGenerics::end(g))
+  gpos <- gpos[gpos$chr %in% chr_levels & gpos$gene %in% rownames(rna) & !duplicated(gpos$gene), ]
+  gpos <- gpos[order(factor(gpos$chr, levels = chr_levels), gpos$start), ]
+  gene_order_file <- file.path(cnv_dir, "gene_order.txt")
+  write.table(gpos, gene_order_file, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+  # Cells (downsampled per sample) and their groups
+  cells <- unlist(lapply(split(colnames(rna), rna@meta.data$sample), function(x)
+    if (length(x) > max_cells_per_sample) sample(x, max_cells_per_sample) else x), use.names = FALSE)
+  ann <- data.frame(cell = cells, group = as.character(rna@meta.data[cells, "sample"]))
+  ann_file <- file.path(cnv_dir, "annotations.txt")
+  write.table(ann, ann_file, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+  icnv <- infercnv::CreateInfercnvObject(
+    raw_counts_matrix = GetAssayData(rna, assay = "RNA", layer = "counts")[gpos$gene, cells],
+    annotations_file  = ann_file, delim = "\t",
+    gene_order_file   = gene_order_file,
+    ref_group_names   = samples$sample[samples$cell_line == cnv_reference_line])
+  icnv <- infercnv::run(icnv, cutoff = 0.1, out_dir = cnv_dir,
+                        cluster_by_groups = TRUE, analysis_mode = "subclusters",
+                        denoise = TRUE, HMM = TRUE, HMM_type = "i6",
+                        num_threads = 4, no_prelim_plot = TRUE, plot_steps = FALSE)
+  # Main heatmap: infercnv/infercnv.png (reference on top, LS1 subclones below)
+
+  # Per-cell scores (residual expression: 1 = neutral, >1 gain, <1 loss)
+  expr <- icnv@expr.data
+  cnv_score <- colMeans((expr - 1)^2)
+  roi_genes <- intersect(gpos$gene[gpos$chr == roi$chr & gpos$start > roi$start & gpos$end < roi$end],
+                         rownames(expr))
+  roi_score <- colMeans(expr[roi_genes, , drop = FALSE])
+  for (nm in c("cnv_score", "cnv_roi_score")) {
+    v <- setNames(rep(NA_real_, ncol(rna)), colnames(rna))
+    v[colnames(expr)] <- if (nm == "cnv_score") cnv_score else roi_score
+    rna[[nm]] <- v
+  }
+  cnv_df <- rna@meta.data[!is.na(rna$cnv_score), ]
+
+  p1 <- ggplot(cnv_df, aes(sample, cnv_score, fill = cell_line)) +
+    geom_violin(scale = "width") + geom_boxplot(width = 0.15, outlier.shape = NA) +
+    theme_classic() + RotatedAxis() + labs(x = NULL, y = "CNV score")
+  p2 <- ggplot(cnv_df, aes(sample, cnv_roi_score, fill = cell_line)) +
+    geom_violin(scale = "width") + geom_hline(yintercept = 1, linetype = "dashed") +
+    theme_classic() + RotatedAxis() + labs(x = NULL, y = paste(roi$name, "(>1 = gain)"))
+  ggsave(file.path(plot_dir, "09_cnv_scores_by_sample.pdf"), p1 + p2, width = 12, height = 4.5)
+  p1 + p2
+
+  p <- FeaturePlot(rna, c("cnv_score", "cnv_roi_score"), order = TRUE, ncol = 2)
+  ggsave(file.path(plot_dir, "09_cnv_scores_UMAP.pdf"), p, width = 12, height = 5)
+  p
+
+  # Mean residual per chromosome and sample (quick karyotype overview)
+  chr_of <- setNames(gpos$chr, gpos$gene)[rownames(expr)]
+  smp_of <- rna@meta.data[colnames(expr), "sample"]
+  chr_tab <- sapply(split(seq_len(ncol(expr)), smp_of), function(ci)
+    tapply(rowMeans(expr[, ci, drop = FALSE]), chr_of, mean))
+  chr_df <- as.data.frame(as.table(chr_tab)); colnames(chr_df) <- c("chr", "sample", "mean_residual")
+  chr_df$chr <- factor(chr_df$chr, levels = chr_levels)
+  write.csv(chr_tab, file.path(cnv_dir, "mean_residual_by_chr_sample.csv"))
+  p <- ggplot(chr_df, aes(chr, sample, fill = mean_residual)) + geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 1) +
+    theme_minimal() + RotatedAxis() + labs(x = NULL, y = NULL)
+  ggsave(file.path(plot_dir, "09_cnv_by_chromosome.pdf"), p, width = 10, height = 3.5)
+  p
+
+  # 10 Mb bin profile per sample (log2 ratio) - compared with the ATAC CNV
+  # profile in the integration Rmd; the bin size must match the ATAC Rmd
+  cnv_bin_size <- 1e7
+  gp <- gpos[match(rownames(expr), gpos$gene), ]
+  bin_key <- paste(gp$chr, floor((gp$start - 1) / cnv_bin_size) * cnv_bin_size + 1, sep = ":")
+  cnv_bins_rna <- bind_rows(lapply(split(seq_len(ncol(expr)), smp_of), function(ci) {
+    b <- tapply(rowMeans(expr[, ci, drop = FALSE]), bin_key, mean)
+    data.frame(key = names(b), value = log2(as.numeric(b)))
+  }), .id = "sample") %>%
+    tidyr::separate(key, c("chr", "bin_start"), sep = ":", convert = TRUE)
+  write.csv(cnv_bins_rna, file.path(cnv_dir, "cnv_bins_rna.csv"), row.names = FALSE)
+
+  # Do LS1 cells with stronger CNV signal differentiate differently?
+  ls1 <- cnv_df[cnv_df$cell_line != cnv_reference_line, ]
+  if ("rna_pseudotime" %in% colnames(ls1)) {
+    ls1$cnv_group <- ifelse(ls1$cnv_roi_score > median(ls1$cnv_roi_score), "high ROI", "low ROI")
+    p <- ggplot(ls1, aes(timepoint, rna_pseudotime, fill = cnv_group)) +
+      geom_violin(scale = "width", position = position_dodge(0.8)) + theme_classic()
+    ggsave(file.path(plot_dir, "09_pseudotime_by_cnv_group.pdf"), p, width = 6, height = 4)
+    p
+  }
+} else if (run_infercnv) {
+  message("inferCNV skipped: install infercnv and EnsDb.Hsapiens.v86")
+}
+```
+
+# 10. Save
+
+```{r save}
+saveRDS(rna,      file.path(res_dir, "rna_combined.rds"))
+saveRDS(rna_diff, file.path(res_dir, "rna_combined_diff.rds"))
+sessionInfo()
+```
